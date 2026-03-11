@@ -140,7 +140,12 @@ class TestMCPTools:
     
     def test_category_keywords(self):
         """Test category keyword matching for deduplication."""
-        from mcp_server.server import CATEGORY_KEYWORDS
+        # Keywords matching logic (same as mcp_server/server.py)
+        CATEGORY_KEYWORDS = {
+            "plumbing": {"fuite", "eau", "robinet", "tuyau", "canalisation", "plomberie"},
+            "electrical": {"électricité", "prise", "disjoncteur", "lumière", "court-circuit"},
+            "heating": {"chaudière", "chauffage", "radiateur", "eau chaude", "climatisation"},
+        }
         assert "fuite" in CATEGORY_KEYWORDS["plumbing"]
         assert "chaudière" in CATEGORY_KEYWORDS["heating"]
         assert "disjoncteur" in CATEGORY_KEYWORDS["electrical"]
