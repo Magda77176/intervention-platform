@@ -250,19 +250,101 @@ class NotificationRequest(BaseModel):
     to: str
     subject: str
     body: str
+    channel: str = "sms"  # sms | email
 
 @app.post("/tools/send_notification")
 async def send_notification(req: NotificationRequest):
-    """Send email notification (placeholder — integrate SendGrid/SMTP)."""
-    # Log notification (actual sending via SendGrid in production)
-    logger.info("notification_sent", extra={
-        "json_fields": {
-            "to": req.to,
-            "subject": req.subject,
-        }
-    })
+    """
+    Send notification via SMS (Twilio) or email.
+    Credentials loaded from environment (Secret Manager in prod).
+    """
+    if req.channel == "sms":
+        return _send_sms(req.to, req.body)
+    else:
+        return _send_email(req.to, req.subject, req.body)
+
+
+def _send_sms(to: str, body: str) -> dict:
+    """Send SMS via Twilio API."""
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
     
-    return {"status": "sent", "to": req.to}
+    if not all([account_sid, auth_token, from_number]):
+        logger.warning("twilio_not_configured")
+        return {"status": "skipped", "reason": "Twilio credentials not configured"}
+    
+    import requests as req_lib
+    
+    try:
+        response = req_lib.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+            auth=(account_sid, auth_token),
+            data={
+                "From": from_number,
+                "To": to,
+                "Body": body[:1600],  # SMS limit
+            },
+            timeout=10,
+        )
+        
+        if response.status_code == 201:
+            data = response.json()
+            logger.info("sms_sent", extra={
+                "json_fields": {
+                    "to": to[-4:],  # Last 4 digits only (PII)
+                    "message_sid": data.get("sid"),
+                    "status": data.get("status"),
+                }
+            })
+            return {"status": "sent", "message_sid": data.get("sid")}
+        else:
+            logger.error(f"Twilio error: {response.status_code} {response.text[:200]}")
+            return {"status": "failed", "error": response.text[:100]}
+    
+    except Exception as e:
+        logger.error(f"SMS send error: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+def _send_email(to: str, subject: str, body: str) -> dict:
+    """Send email via SendGrid API."""
+    sendgrid_key = os.getenv("SENDGRID_API_KEY")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "noreply@intervention-platform.fr")
+    
+    if not sendgrid_key:
+        logger.warning("sendgrid_not_configured")
+        return {"status": "skipped", "reason": "SendGrid not configured"}
+    
+    import requests as req_lib
+    
+    try:
+        response = req_lib.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {sendgrid_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": to}]}],
+                "from": {"email": from_email},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            },
+            timeout=10,
+        )
+        
+        if response.status_code in [200, 202]:
+            logger.info("email_sent", extra={
+                "json_fields": {"to": to, "subject": subject[:50]}
+            })
+            return {"status": "sent"}
+        else:
+            return {"status": "failed", "error": response.text[:100]}
+    
+    except Exception as e:
+        logger.error(f"Email send error: {e}")
+        return {"status": "failed", "error": str(e)}
 
 
 # ============================================================
