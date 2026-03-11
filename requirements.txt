@@ -1,0 +1,10 @@
+fastapi>=0.109
+uvicorn>=0.27
+google-cloud-aiplatform>=1.38
+google-cloud-firestore>=2.14
+google-cloud-storage>=2.14
+google-cloud-pubsub>=2.18
+google-cloud-bigquery>=3.14
+google-cloud-logging>=3.9
+pydantic>=2.5
+pytest>=7.4
