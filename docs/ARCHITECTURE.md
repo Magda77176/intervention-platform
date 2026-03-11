@@ -1,110 +1,74 @@
 # Architecture — Intervention Platform
 
-## System Overview
+## Multi-Agent Pipeline
+
+Same pattern as enterprise agent pipelines (Orchestrator → Agents → MCP Tools):
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Tenant    │     │   Manager    │     │  Provider    │
-│   (PWA)     │     │  (Console)   │     │  (Portal)    │
-└──────┬──────┘     └──────┬───────┘     └──────┬───────┘
-       │                   │                    │
-       └───────────────────┼────────────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │  Cloud Run   │
-                    │  (FastAPI)   │
-                    └──┬──┬──┬──┬─┘
-                       │  │  │  │
-          ┌────────────┘  │  │  └────────────┐
-          ▼               ▼  ▼               ▼
-    ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-    │Vertex AI │  │Firestore │  │  Pub/Sub │  │  Cloud   │
-    │(Gemini)  │  │(tickets, │  │(notifs,  │  │ Storage  │
-    │          │  │providers)│  │ SLA,     │  │(photos)  │
-    │- Prequal │  │          │  │ events)  │  │          │
-    │- Photos  │  │          │  │          │  │          │
-    │- Scoring │  │          │  │          │  │          │
-    └──────────┘  └──────────┘  └──────────┘  └──────────┘
-          │                          │
-          │                   ┌──────▼───────┐
-          │                   │   Workers    │
-          │                   │- Email       │
-          │                   │- SMS         │
-          │                   │- Slack       │
-          │                   └──────────────┘
-          │
-    ┌─────▼──────┐   ┌──────────┐   ┌──────────┐
-    │  BigQuery  │   │  Cloud   │   │  Cloud   │
-    │  (KPIs,    │   │ Logging  │   │Scheduler │
-    │  trends)   │   │(struct.) │   │(SLA cron)│
-    └────────────┘   └──────────┘   └──────────┘
+Client → Orchestrator → Pre-qualification (Vertex AI Gemini)
+                      → Assignment (MCP + Scoring)
+                      → Notification (DLP + Email)
+                      → MCP Tools (5 shared tools)
 ```
 
-## AI Modules
+5 microservices on Cloud Run, communicating via HTTP (sync) and Pub/Sub (async).
 
-### 1. Pre-qualification (`prequalification.py`)
-- Input: tenant description + questionnaire answers
-- Output: payer indication, urgency, category, summary
-- Method: Gemini 2.0 Flash structured prompt
-- Fallback: rule-based classification (keywords)
-- Deduplication: same address + same category within 7 days
+## Data Flow
 
-### 2. Photo Analysis (`photo_analysis.py`)
-- Input: incident photos (from Cloud Storage)
-- Output: severity, safety hazards, category confirmation
-- Method: Gemini Vision (multimodal)
-- Use case: validate tenant claims, detect emergencies
+```
+Ticket created
+  │
+  ├── MCP: search_address → validate, extract postal code
+  ├── MCP: check_duplicate → Firestore query (7-day window)
+  │
+  ├── Pre-qual Agent:
+  │     ├── DLP scan description (PII detection)
+  │     └── Vertex AI Gemini → payer + urgency + category
+  │
+  ├── MCP: analyze_photo → Gemini Vision (severity + hazards)
+  │
+  ├── Firestore: store ticket (pending_validation)
+  │
+  └── Notification Agent:
+        ├── DLP scan outgoing text
+        └── Email manager
 
-### 3. Provider Scoring (`provider_scoring.py`)
-- Input: ticket requirements + provider pool
-- Output: ranked list of eligible providers
-- Criteria: skills (30%), zone (20%), performance (25%), availability (15%), pricing (10%)
-- Auto-dispatch: round-robin with scoring
+Manager validates → Orchestrator:
+  │
+  ├── Assignment Agent:
+  │     ├── MCP: lookup_providers (skills + zone)
+  │     └── Score (5 criteria) → best provider
+  │
+  ├── Notification Agent → DLP → email provider + tenant
+  │
+  └── Pub/Sub: ticket.assigned
+```
 
-### 4. SLA Engine (`sla_engine.py`)
-- Monitors every ticket at every stage
-- Configurable limits by urgency (emergency: 2h validation, normal: 24h)
-- Pub/Sub escalation events on breach
-- Cloud Scheduler triggers periodic checks
+## Shared Components
 
-### 5. Notifications (`notifications.py`)
-- 16 notification types (creation → close)
-- Templates per recipient type (tenant/manager/provider)
-- Pub/Sub decoupled delivery
-- MVP: email only (extensible to SMS, push, WhatsApp)
+### schemas.py (Pydantic)
+- Ticket, Provider, AgentMessage
+- Strict typing, enums for status/urgency/category
+- JSON-serializable for Pub/Sub transport
 
-### 6. Analytics (`analytics.py`)
-- KPIs: resolution rate, SLA compliance, CSAT, reopening rate
-- Pre-qualification accuracy (AI vs manager decision)
-- BigQuery snapshots for trend analysis
-- Per-category and per-provider breakdowns
+### tracing.py (OpenTelemetry)
+- Cloud Trace in production
+- Console exporter in development
+- Every agent instruments its key operations
 
-## 12 Processes
+### pubsub.py
+- Fire-and-forget event publishing
+- Attributes for subscriber filtering
 
-| # | Process | AI Involved | GCP Services |
-|---|---------|-------------|--------------|
-| 1 | Déclaration & Pré-qualification | ✅ Gemini + Vision | Vertex AI, Firestore, Cloud Storage |
-| 2 | Validation Gestionnaire | — | Firestore, Pub/Sub |
-| 3 | Refusé (locataire payeur) | — | Firestore, Pub/Sub |
-| 4 | Assignation Prestataire | ✅ Scoring engine | Firestore |
-| 5 | Planification | — | Firestore, Pub/Sub |
-| 6 | Intervention (multi-étapes) | — | Firestore, Cloud Storage |
-| 7 | Validation Locataire (CSAT) | — | Firestore |
-| 8 | Clôture & Archivage | — | Firestore, BigQuery |
-| 9 | Ré-ouverture | — | Firestore, Pub/Sub |
-| 10 | SLA & Escalades | ✅ SLA engine | Cloud Scheduler, Pub/Sub |
-| 11 | Messagerie & Notifications | — | Pub/Sub |
-| 12 | Qualité & Contrôles | ✅ Analytics | BigQuery |
+## 10 GCP Services
 
-## GCP Services (10)
-
-1. **Cloud Run** — API hosting (FastAPI)
-2. **Vertex AI** — Gemini for pre-qualification + photo analysis
-3. **Firestore** — Tickets, providers, sessions
-4. **Cloud Storage** — Photos, documents, intervention proofs
-5. **Pub/Sub** — Notifications, SLA events, analytics events
-6. **Cloud Logging** — Structured JSON logs
-7. **Cloud Scheduler** — SLA checks (every 15min), KPI snapshots (daily)
-8. **BigQuery** — KPI trends, reporting
-9. **Secret Manager** — API keys
-10. **Cloud Build** — CI/CD from GitHub
+1. Cloud Run (5 services)
+2. Vertex AI (Gemini 2.0 Flash)
+3. Firestore (tickets, providers)
+4. Cloud Storage (photos)
+5. Pub/Sub (events)
+6. Cloud DLP (PII scan)
+7. Cloud Logging (structured)
+8. Cloud Trace (OpenTelemetry)
+9. Secret Manager
+10. Cloud Build (CI/CD)
